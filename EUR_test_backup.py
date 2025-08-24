@@ -74,6 +74,17 @@ trade_count = 0
 # Session stats (v1 only London)
 session_stats = {'LDN': {'wins': 0, 'losses': 0, 'total': 0}}
 
+total_sl2 = 0
+total_tp5 = 0
+total_sl5 = 0
+# Day-of-week stats
+withdrawals_by_year = {}  # "YYYY" -> float
+yearly_pnl = {}           # optional: "YYYY" -> float
+total_tp1 = 0
+total_tp2 = 0
+total_sl = 0
+day_stats = {i: {'SL2': 0, 'SL5': 0, 'TP5': 0} for i in range(7)}
+
 
 ACCOUNT_BALANCE = 100_000  # Starting FTMO account balance
 LIQUIDATION_COUNT = 0  # number of times account is liquidated
@@ -129,6 +140,25 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     filename = entry_time.strftime("charts/html/%Y-%m-%d_%H-%M.html")
     fig.write_html(filename)'''
+
+
+
+def find_fractal_highs_lows(df):
+    fractal_highs = []
+    fractal_lows = []
+    for i in range(2, len(df) - 2):
+        center = df.iloc[i]
+        left = df.iloc[i - 2:i]
+        right = df.iloc[i + 1:i + 3]
+
+        if center['high'] > left['high'].max() and center['high'] > right['high'].max():
+            fractal_highs.append({'time': center['time'], 'price': center['high']})
+
+        if center['low'] < left['low'].min() and center['low'] < right['low'].min():
+            fractal_lows.append({'time': center['time'], 'price': center['low']})
+
+    return fractal_highs, fractal_lows
+
 
 
 # def find_real_fvgs_custom(df):
@@ -226,6 +256,20 @@ def simulate_trade(day_3m, confirm_row, sweep_dir, sweep_price, asia_high, asia_
         print("    ⛔ Skipped: entry timeout")
         total_skips += 1
         return None
+
+def simulate_trade(df_3m, bos_time, fractal_time, direction, df_full, sweep_time, fractal_type,
+                   asia_high, asia_low, asia_range_pips):
+    """Simulate a single trade. Returns PnL or None if skipped."""
+    global total_sl2, total_tp5, total_skips, ACCOUNT_BALANCE, last_trade_month, total_tp1, total_sl
+    entry_window_end = bos_time + timedelta(minutes=5 * ENTRY_TIMEOUT_BARS)
+    entry_rows = df_3m[(df_3m['time'] >= bos_time) & (df_3m['time'] <= entry_window_end)]
+    if entry_rows.empty:
+        print("    ⛔ Skipped: entry timeout")
+        total_skips += 1
+        return None
+    entry_row = entry_rows.iloc[0]
+    entry_price = entry_row['close']
+    entry_time = entry_row['time']
     current_trade_month = entry_time.to_period("M")
     global last_trade_month
     if last_trade_month is None:
@@ -447,6 +491,118 @@ def find_confirmation(day_5m, sweep_dir, sweep_time, asia_high, asia_low):
 
 
 def run_backtest(df_3m, df_5m):
+
+    print(f"    📥 ENTRY at {entry_time} | Price: {entry_price:.5f}")
+    start_sl_window = bos_time.replace(hour=8, minute=0, second=0, microsecond=0)
+    sl_range = df_3m[(df_3m['time'] >= start_sl_window) & (df_3m['time'] <= bos_time)]
+    if sl_range.empty:
+        print("    ⛔ Skipped: SL range empty")
+        total_skips += 1
+        return None
+    if direction == 'BOS Down':
+        sl = sl_range['high'].max()
+        stop_distance = sl - entry_price
+        tp = entry_price - 2 * stop_distance
+    else:
+        sl = sl_range['low'].min()
+        stop_distance = entry_price - sl
+        tp = entry_price + 2 * stop_distance
+    if stop_distance <= 0:
+        print("    ⛔ Skipped: invalid stop distance")
+        total_skips += 1
+        return None
+    stop_distance_pips = price_to_pips(stop_distance)
+    risk_per_trade = ACCOUNT_BALANCE * RISK_PER_EQUITY
+    lot_size = risk_per_trade / (stop_distance * PIP_VALUE_PER_LOT)
+    print(f"    📊 Lot size: {lot_size:.2f} (Stop distance: {stop_distance_pips:.1f} pips)")
+    after_entry = df_3m[df_3m['time'] > entry_time]
+    for _, row in after_entry.iterrows():
+        if (direction == 'BOS Up' and row['low'] <= sl) or (direction == 'BOS Down' and row['high'] >= sl):
+            pnl = -risk_per_trade
+            ACCOUNT_BALANCE += pnl
+            total_sl2 += pnl
+            total_sl += 1
+            month_key = row['time'].strftime('%Y-%m')
+            monthly_pnl[month_key] = monthly_pnl.get(month_key, 0) + pnl
+            trade_log.append({
+                'entry_time': entry_time,
+                'exit_time': row['time'],
+                'direction': 'BUY' if direction == 'BOS Up' else 'SELL',
+                'qty': lot_size,
+                'entry_px': entry_price,
+                'exit_px': sl,
+                'sl_px': sl,
+                'tp_px': tp,
+                'gross_pnl': pnl,
+                'fee': lot_size * FEE_PER_LOT,
+                'net_pnl': pnl - lot_size * FEE_PER_LOT,
+                'asia_high': asia_high,
+                'asia_low': asia_low,
+                'asia_range_pips': asia_range_pips,
+            })
+            return pnl
+        if (direction == 'BOS Up' and row['high'] >= tp) or (direction == 'BOS Down' and row['low'] <= tp):
+            pnl = risk_per_trade * 2
+            ACCOUNT_BALANCE += pnl
+            total_tp5 += pnl
+            total_tp1 += 1
+            month_key = row['time'].strftime('%Y-%m')
+            monthly_pnl[month_key] = monthly_pnl.get(month_key, 0) + pnl
+            trade_log.append({
+                'entry_time': entry_time,
+                'exit_time': row['time'],
+                'direction': 'BUY' if direction == 'BOS Up' else 'SELL',
+                'qty': lot_size,
+                'entry_px': entry_price,
+                'exit_px': tp,
+                'sl_px': sl,
+                'tp_px': tp,
+                'gross_pnl': pnl,
+                'fee': lot_size * FEE_PER_LOT,
+                'net_pnl': pnl - lot_size * FEE_PER_LOT,
+                'asia_high': asia_high,
+                'asia_low': asia_low,
+                'asia_range_pips': asia_range_pips,
+            })
+            return pnl
+    print("    ⛔ Skipped: No SL or TP hit after entry")
+    total_skips += 1
+    return None
+
+def detect_bos(df_3m, sweep_dir, sweep_time):
+    fractal_highs, fractal_lows = find_fractal_highs_lows(df_3m)
+
+    # Define minimum allowed time for fractals (07:00 Amsterdam)
+    min_fractal_time = sweep_time.replace(hour=7, minute=0, second=0, microsecond=0)
+
+    for i in range(2, len(df_3m) - 2):
+        candle = df_3m.iloc[i]
+        close_price = candle['close']
+        candle_time = candle['time']
+
+        if candle_time <= sweep_time:
+            continue
+
+        if sweep_dir == 'low':
+            for f in reversed(fractal_highs):
+                if f['time'] < candle_time and f['time'] >= min_fractal_time and close_price > f['price']:
+                    print(
+                        f"  ↳ BOS Up (✅ HIGH Fractal): candle closed above fractal HIGH {f['price']:.2f} (fract. at {f['time']}, BOS candle at {candle_time})")
+                    return candle_time, 'BOS Up', f['time'], 'high'
+
+        elif sweep_dir == 'high':
+            for f in reversed(fractal_lows):
+                if f['time'] < candle_time and f['time'] >= min_fractal_time and close_price < f['price']:
+                    print(
+                        f"  ↳ BOS Down (✅ LOW Fractal): candle closed below fractal LOW {f['price']:.2f} (fract. at {f['time']}, BOS candle at {candle_time})")
+                    return candle_time, 'BOS Down', f['time'], 'low'
+
+    print("  ⛔ No valid BOS found after sweep.")
+    return None, None, None, None
+
+
+
+def detect_sweep_and_bos(df_3m, df_5m):
     df_5m['date'] = df_5m['time'].dt.date
     global daily_wins, daily_losses, current_trade_day
     for day in df_5m['date'].unique():
@@ -483,6 +639,25 @@ def run_backtest(df_3m, df_5m):
                 continue
             print(f"[{day}] Sweep {sweep_dir.upper()} at {sweep_time} | Confirm at {confirm_row['time']}")
             pnl, outcome = simulate_trade(day_3m, confirm_row, sweep_dir, sweep_price, asia_high, asia_low, asia_range_pips)
+            sweep_start = AMS_TZ.localize(datetime.combine(day, LONDON_SWEEP_START_AMS))
+            sweep_end = AMS_TZ.localize(datetime.combine(day, LONDON_SWEEP_END_AMS))
+            df_sweep = day_5m[(day_5m['time'] >= sweep_start) & (day_5m['time'] <= sweep_end)]
+            sweep_dir = sweep_time = None
+            for _, row in df_sweep.iterrows():
+                if row['high'] > asia_high:
+                    sweep_dir, sweep_time = 'high', row['time']
+                    break
+                if row['low'] < asia_low:
+                    sweep_dir, sweep_time = 'low', row['time']
+                    break
+            if sweep_dir is None:
+                continue
+            bos_time, bos_label, fractal_time, fractal_type = detect_bos(day_5m, sweep_dir, sweep_time)
+            if bos_time is None:
+                continue
+            print(f"[{day}] Sweep {sweep_dir.upper()} at {sweep_time} | BOS at {bos_time}")
+            pnl = simulate_trade(day_3m, bos_time, fractal_time, bos_label, day_3m.copy(), sweep_time, fractal_type,
+                                 asia_high, asia_low, asia_range_pips)
             if pnl is not None:
                 if pnl > 0:
                     daily_wins += 1
@@ -512,6 +687,16 @@ def print_trade_summary():
     win_rate = (sum(1 for t in trade_log if t['outcome'] != 'SL') / total_trades * 100) if total_trades else 0
     print(f"📈 Profit Factor: {pf:.2f} | Avg R: {avg_r:.2f} | Win%: {win_rate:.1f}%\n")
 
+
+    net_pnl = total_tp5 + total_sl5 + total_sl2
+    print(f"""
+📜 Trade Summary:
+  ❌ SL full:     ${-total_sl2:,.2f}
+  🟡 SL after 3R: ${total_sl5:,.2f}
+  🏁 TP 5R final: ${total_tp5:,.2f}
+  ⛘ Skipped:     {total_skips}
+💰 Net P&L:      ${net_pnl:,.2f}
+""")
     print("🕒 Breakdown by Day of Week:")
     days = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday']
     for i in range(7):
@@ -522,6 +707,7 @@ def print_trade_summary():
     for sess, sstats in session_stats.items():
         wr = (sstats['wins'] / sstats['total'] * 100) if sstats['total'] else 0
         print(f" {sess}: {sstats['wins']}W/{sstats['losses']}L ({wr:.1f}% win)")
+        print(f" {days[i]}: SL2={stats['SL2']}, SL5={stats['SL5']}, TP5={stats['TP5']}")
 
     print(f"\n💣 Total Liquidations: {LIQUIDATION_COUNT}")
 
@@ -609,6 +795,8 @@ if __name__ == '__main__':
                    .reset_index())
 
     run_backtest(df_3m, df_5m)
+
+    detect_sweep_and_bos(df_3m, df_5m)
 
     print("1-Minute Data Range:")
     print("Start:", df_3m['time'].min())
