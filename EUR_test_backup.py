@@ -43,6 +43,7 @@ def pips_to_price(pips: float) -> float:
 
 # Summary counters (money-mapped)
 total_skips = 0
+skip_log = []  # optional diagnostic info
 
 # --- trade logging ---------------------------------------------------------
 trade_log = []        # one dict per closed trade
@@ -63,6 +64,15 @@ total_tp1_hits = 0
 total_tp2_hits = 0
 total_stop_hits = 0
 day_stats = {i: {'TP1': 0, 'TP2': 0, 'SL': 0} for i in range(7)}
+
+# Profit-factor / R-multiple tracking
+gross_wins = 0.0
+gross_losses = 0.0
+total_r_multiple = 0.0
+trade_count = 0
+
+# Session stats (v1 only London)
+session_stats = {'LDN': {'wins': 0, 'losses': 0, 'total': 0}}
 
 
 ACCOUNT_BALANCE = 100_000  # Starting FTMO account balance
@@ -235,27 +245,35 @@ def simulate_trade(day_3m, confirm_row, sweep_dir, sweep_price, asia_high, asia_
 
     if sweep_dir == 'low':
         stop_price = sweep_price - pips_to_price(1.5)
-        risk = entry_price - stop_price
+        price_risk = entry_price - stop_price
         opp_boundary = asia_high
     else:
         stop_price = sweep_price + pips_to_price(1.5)
-        risk = stop_price - entry_price
+        price_risk = stop_price - entry_price
         opp_boundary = asia_low
     initial_stop = stop_price
 
-    if risk <= 0:
+    stop_pips = price_to_pips(price_risk)
+    if stop_pips <= 0:
         print("    ⛔ Skipped: invalid stop distance")
         total_skips += 1
+        skip_log.append({'time': confirm_time, 'reason': 'invalid_stop'})
         return None
 
     risk_capital = ACCOUNT_BALANCE * RISK_PER_EQUITY
-    lot_size = risk_capital / (risk * PIP_VALUE_PER_LOT)
-    tp1 = entry_price + risk if sweep_dir == 'low' else entry_price - risk
+    lot_size = risk_capital / (stop_pips * PIP_VALUE_PER_LOT)
+    if lot_size <= 0 or lot_size > 100:
+        print("    ⛔ Skipped: absurd lot size")
+        total_skips += 1
+        skip_log.append({'time': confirm_time, 'reason': 'lot_size'})
+        return None
+
+    tp1 = entry_price + pips_to_price(stop_pips) if sweep_dir == 'low' else entry_price - pips_to_price(stop_pips)
 
     dist_to_boundary = (opp_boundary - entry_price) if sweep_dir == 'low' else (entry_price - opp_boundary)
-    r_boundary = dist_to_boundary / risk
+    r_boundary = dist_to_boundary / pips_to_price(stop_pips)
     r2 = min(max(r_boundary, 1.8), 2.5)
-    tp2 = entry_price + r2 * risk if sweep_dir == 'low' else entry_price - r2 * risk
+    tp2 = entry_price + pips_to_price(r2 * stop_pips) if sweep_dir == 'low' else entry_price - pips_to_price(r2 * stop_pips)
 
     print(f"    📥 ENTRY {entry_label} at {entry_time} | Price: {entry_price:.5f} | Stop {stop_price:.5f}")
 
@@ -295,7 +313,7 @@ def simulate_trade(day_3m, confirm_row, sweep_dir, sweep_price, asia_high, asia_
                 if row['low'] <= stop_price:
                     exit_price = stop_price
                     exit_time = row['time']
-                    outcome = 'TP1'
+                    outcome = 'TP1_BE'
                     break
                 if row['high'] >= tp2:
                     profit2 = risk_capital / 2 * r2
@@ -308,7 +326,7 @@ def simulate_trade(day_3m, confirm_row, sweep_dir, sweep_price, asia_high, asia_
                 if row['high'] >= stop_price:
                     exit_price = stop_price
                     exit_time = row['time']
-                    outcome = 'TP1'
+                    outcome = 'TP1_BE'
                     break
                 if row['low'] <= tp2:
                     profit2 = risk_capital / 2 * r2
@@ -320,7 +338,7 @@ def simulate_trade(day_3m, confirm_row, sweep_dir, sweep_price, asia_high, asia_
 
     if outcome is None:
         if hit_tp1:
-            outcome = 'TP1'
+            outcome = 'TP1_BE'
         else:
             print("    ⛔ Skipped: No SL or TP hit after entry")
             total_skips += 1
@@ -330,6 +348,18 @@ def simulate_trade(day_3m, confirm_row, sweep_dir, sweep_price, asia_high, asia_
     total_pnl += pnl_total
     equity_curve.append(ACCOUNT_BALANCE)
     equity_time.append(exit_time)
+
+    r_multiple = pnl_total / risk_capital if risk_capital else 0
+    global gross_wins, gross_losses, total_r_multiple, trade_count, session_stats
+    trade_count += 1
+    total_r_multiple += r_multiple
+    session_stats['LDN']['total'] += 1
+    if pnl_total > 0:
+        gross_wins += pnl_total
+        session_stats['LDN']['wins'] += 1
+    elif pnl_total < 0:
+        gross_losses += pnl_total
+        session_stats['LDN']['losses'] += 1
 
     month_key = exit_time.strftime('%Y-%m')
     monthly_pnl[month_key] = monthly_pnl.get(month_key, 0) + pnl_total
@@ -345,24 +375,34 @@ def simulate_trade(day_3m, confirm_row, sweep_dir, sweep_price, asia_high, asia_
         day_stats[exit_time.weekday()]['TP1'] += 1
 
     trade_log.append({
+        'date': entry_time.date(),
+        'session': 'LDN',
+        'sweep_side': sweep_dir,
+        'confirm_time': confirm_time,
         'entry_time': entry_time,
         'exit_time': exit_time,
         'direction': 'BUY' if sweep_dir == 'low' else 'SELL',
-        'qty': lot_size,
         'entry_px': entry_price,
-        'exit_px': exit_price,
         'sl_px': initial_stop,
         'tp1_px': tp1,
         'tp2_px': tp2,
-        'gross_pnl': pnl_total,
-        'fee': lot_size * FEE_PER_LOT,
-        'net_pnl': pnl_total - lot_size * FEE_PER_LOT,
+        'exit_px': exit_price,
+        'stop_pips': stop_pips,
+        'risk_usd': risk_capital,
+        'qty_lots': lot_size,
+        'outcome': outcome,
+        'r_multiple': r_multiple,
         'asia_high': asia_high,
         'asia_low': asia_low,
         'asia_range_pips': asia_range_pips,
+        'gross_pnl': pnl_total,
+        'fee': lot_size * FEE_PER_LOT,
+        'net_pnl': pnl_total - lot_size * FEE_PER_LOT,
     })
 
-    return pnl_total
+    check_liquidation(exit_time)
+
+    return pnl_total, outcome
 
 def find_sweep(day_5m, asia_high, asia_low, day):
     sweep_start = AMS_TZ.localize(datetime.combine(day, LONDON_SWEEP_START_AMS))
@@ -438,8 +478,11 @@ def run_backtest(df_3m, df_5m):
             confirm_row = find_confirmation(day_5m, sweep_dir, sweep_time, asia_high, asia_low)
             if confirm_row is None:
                 continue
+            if daily_losses >= DAILY_MAX_LOSSES or daily_wins >= DAILY_MAX_WINS:
+                print(f"   🔒 Daily guardrail already hit ({daily_losses} losses, {daily_wins} wins).")
+                continue
             print(f"[{day}] Sweep {sweep_dir.upper()} at {sweep_time} | Confirm at {confirm_row['time']}")
-            pnl = simulate_trade(day_3m, confirm_row, sweep_dir, sweep_price, asia_high, asia_low, asia_range_pips)
+            pnl, outcome = simulate_trade(day_3m, confirm_row, sweep_dir, sweep_price, asia_high, asia_low, asia_range_pips)
             if pnl is not None:
                 if pnl > 0:
                     daily_wins += 1
@@ -463,11 +506,22 @@ def print_trade_summary():
   ⛘ Skipped:  {total_skips}
 💰 Net P&L:   ${net_pnl:,.2f}
 """)
+    total_trades = len(trade_log)
+    avg_r = total_r_multiple / trade_count if trade_count else 0
+    pf = (gross_wins / abs(gross_losses)) if gross_losses < 0 else float('inf')
+    win_rate = (sum(1 for t in trade_log if t['outcome'] != 'SL') / total_trades * 100) if total_trades else 0
+    print(f"📈 Profit Factor: {pf:.2f} | Avg R: {avg_r:.2f} | Win%: {win_rate:.1f}%\n")
+
     print("🕒 Breakdown by Day of Week:")
     days = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday']
     for i in range(7):
         stats = day_stats[i]
         print(f" {days[i]}: TP1={stats['TP1']}, TP2={stats['TP2']}, SL={stats['SL']}")
+
+    print("\n🕛 Hit Rate by Session:")
+    for sess, sstats in session_stats.items():
+        wr = (sstats['wins'] / sstats['total'] * 100) if sstats['total'] else 0
+        print(f" {sess}: {sstats['wins']}W/{sstats['losses']}L ({wr:.1f}% win)")
 
     print(f"\n💣 Total Liquidations: {LIQUIDATION_COUNT}")
 
